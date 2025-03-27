@@ -1,6 +1,6 @@
 # GoLFITester - LFI Vulnerability Scanner
 
-GolfiTester is a powerful and flexible Local File Inclusion (LFI) vulnerability scanner written in Go. It helps security professionals identify and test for LFI vulnerabilities in web applications.
+GoLFITester is a powerful and flexible Local File Inclusion (LFI) vulnerability scanner written in Go. It helps security professionals identify and test for LFI vulnerabilities in web applications.
 
 ## Features
 
