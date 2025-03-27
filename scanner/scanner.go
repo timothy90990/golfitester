@@ -19,7 +19,6 @@ type Config struct {
 	TargetURL     string
 	ParamsList    []string
 	ScanAllParams bool
-	ParamName     string   // For backward compatibility
 	Wordlist      string
 	Threads       int
 	Timeout       int
@@ -28,6 +27,7 @@ type Config struct {
 	Cookies       string
 	Headers       string
 	Depth         int
+	RequestFile   string   // Path to a request file (e.g., from Burp)
 }
 
 // Result represents a found vulnerability
@@ -288,18 +288,89 @@ func (s *Scanner) generatePathTraversalPayloads() {
 // Run executes the LFI vulnerability scan
 func (s *Scanner) Run() []Result {
 	var results []Result
+	var targetURL string
+	var requestInfo *RequestInfo
+
+	// Check if we're using a request file or a target URL
+	if s.config.RequestFile != "" {
+		// Parse the request file
+		var err error
+		requestInfo, err = ParseRequestFile(s.config.RequestFile)
+		if err != nil {
+			fmt.Printf("Error parsing request file: %s\n", err)
+			return results
+		}
+		
+		targetURL = requestInfo.URL
+		
+		// Set cookies from request if not specified via command line
+		if s.config.Cookies == "" && requestInfo.Cookies != "" {
+			// Add cookies from the request file to the headers
+			s.headers["Cookie"] = requestInfo.Cookies
+		}
+		
+		// Add headers from request if not already set via command line
+		for k, v := range requestInfo.Headers {
+			if _, exists := s.headers[k]; !exists {
+				s.headers[k] = v
+			}
+		}
+		
+		if s.config.Verbose {
+			fmt.Printf("Parsed request file: %s %s\n", requestInfo.Method, targetURL)
+			fmt.Printf("Found %d query parameters, %d form parameters\n", 
+				len(requestInfo.QueryParams), len(requestInfo.FormParams))
+		}
+	} else {
+		// Using target URL
+		targetURL = s.config.TargetURL
+	}
 
 	// Get list of parameters to test
 	var paramsToTest []string
 	if len(s.config.ParamsList) > 0 {
 		// Use specified parameters
 		paramsToTest = s.config.ParamsList
+	} else if requestInfo != nil {
+		// Auto-discover parameters from request
+		if s.config.Verbose {
+			fmt.Println("Extracting parameters from request file...")
+		}
+		paramsToTest = GetParametersFromRequest(requestInfo)
+		
+		// If no parameters were found or user wants to test additional ones
+		if len(paramsToTest) == 0 {
+			fmt.Println("No parameters found in the request. Would you like to test with common parameter names? (y/n)")
+			var response string
+			fmt.Scanln(&response)
+			if strings.HasPrefix(strings.ToLower(response), "y") {
+				paramsToTest = s.ParameterDiscovery(targetURL)
+			}
+		} else {
+			fmt.Printf("Found the following parameters in the request: %s\n", strings.Join(paramsToTest, ", "))
+			fmt.Println("Would you like to test only these parameters? (y/n)")
+			var response string
+			fmt.Scanln(&response)
+			if !strings.HasPrefix(strings.ToLower(response), "y") {
+				fmt.Println("Would you like to add common parameter names to test as well? (y/n)")
+				fmt.Scanln(&response)
+				if strings.HasPrefix(strings.ToLower(response), "y") {
+					// Add common parameters
+					commonParams := s.ParameterDiscovery(targetURL)
+					for _, param := range commonParams {
+						if !containsParam(paramsToTest, param) {
+							paramsToTest = append(paramsToTest, param)
+						}
+					}
+				}
+			}
+		}
 	} else {
-		// Auto-discover parameters
+		// Auto-discover parameters from URL
 		if s.config.Verbose {
 			fmt.Println("No specific parameters provided, auto-discovering parameters...")
 		}
-		paramsToTest = s.ParameterDiscovery(s.config.TargetURL)
+		paramsToTest = s.ParameterDiscovery(targetURL)
 	}
 
 	if s.config.Verbose {
@@ -322,8 +393,16 @@ func (s *Scanner) Run() []Result {
 		go func() {
 			defer wg.Done()
 			for item := range workerChan {
-				if result, found := s.testPayload(item.param, item.payload); found {
-					resultsChan <- result
+				if requestInfo != nil {
+					// Test using request file approach
+					if result, found := s.testRequestPayload(requestInfo, item.param, item.payload); found {
+						resultsChan <- result
+					}
+				} else {
+					// Test using URL approach
+					if result, found := s.testPayload(item.param, item.payload); found {
+						resultsChan <- result
+					}
 				}
 			}
 		}()
@@ -415,6 +494,69 @@ func (s *Scanner) testPayload(paramName, payload string) (Result, bool) {
 	if found {
 		return Result{
 			URL:       testURL,
+			Parameter: paramName,
+			Payload:   payload,
+			Evidence:  evidence,
+		}, true
+	}
+
+	return Result{}, false
+}
+
+// testRequestPayload tests a single LFI payload using an imported request file
+func (s *Scanner) testRequestPayload(reqInfo *RequestInfo, paramName, payload string) (Result, bool) {
+	if s.config.Verbose {
+		fmt.Printf("Testing parameter '%s' in request with payload: %s\n", paramName, payload)
+	}
+
+	// Create a new request with the payload
+	req, err := CreateHTTPRequestFromRequestInfo(reqInfo, paramName, payload)
+	if err != nil {
+		if s.config.Verbose {
+			fmt.Printf("Error creating request with payload: %s\n", err)
+		}
+		return Result{}, false
+	}
+
+	// Add context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.config.Timeout)*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	// Override with command-line headers if provided
+	for k, v := range s.headers {
+		req.Header.Set(k, v)
+	}
+
+	// Override with command-line cookies if provided
+	if s.config.Cookies != "" {
+		req.Header.Set("Cookie", s.config.Cookies)
+	}
+
+	// Send the request
+	resp, err := s.client.Do(req)
+	if err != nil {
+		if s.config.Verbose {
+			fmt.Printf("Error sending request: %s\n", err)
+		}
+		return Result{}, false
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if s.config.Verbose {
+			fmt.Printf("Error reading response: %s\n", err)
+		}
+		return Result{}, false
+	}
+
+	// Check for evidence of successful LFI
+	found, evidence := s.checkForLFIEvidence(payload, string(body))
+	if found {
+		return Result{
+			URL:       req.URL.String(),
 			Parameter: paramName,
 			Payload:   payload,
 			Evidence:  evidence,

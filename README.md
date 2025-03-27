@@ -8,6 +8,7 @@ GoLFITester is a powerful and flexible Local File Inclusion (LFI) vulnerability 
 - **Multiple Evasion Techniques**: Includes various WAF bypass techniques
 - **Automatic Parameter Discovery**: Finds potential vulnerable parameters
 - **Multiple Parameter Testing**: Test multiple parameters simultaneously
+- **Request Import**: Import HTTP requests from Burp Suite or other tools
 - **Multithreaded**: Fast scanning with configurable number of threads
 - **Customizable Wordlists**: Use your own custom LFI payloads
 - **Verbose Mode**: Detailed output for debugging and learning
@@ -30,55 +31,71 @@ go build -o golfitester
 
 ```bash
 # Basic usage
-./golfitester --url "http://example.com/page.php?file=example"
+./golfitester -u "http://example.com/page.php?file=example"
 
-# Specify a single parameter to test
-./golfitester --url "http://example.com/page.php" --param "file"
-
-# Specify multiple parameters to test
-./golfitester --url "http://example.com/page.php" --params "file,include,path"
+# Specify parameter(s) to test (single or comma-separated)
+./golfitester -u "http://example.com/page.php" -p "file"
+./golfitester -u "http://example.com/page.php" -p "file,include,path"
 
 # Scan all detectable parameters
-./golfitester --url "http://example.com/page.php" --scan-all-params
+./golfitester -u "http://example.com/page.php" -a
 
 # Use a custom wordlist
-./golfitester --url "http://example.com/page.php" --wordlist "/path/to/wordlist.txt"
+./golfitester -u "http://example.com/page.php" -w "/path/to/wordlist.txt"
 
 # Set concurrency level
-./golfitester --url "http://example.com/page.php" --threads 20
+./golfitester -u "http://example.com/page.php" -t 20
 
 # Enable verbose output
-./golfitester --url "http://example.com/page.php" --v
+./golfitester -u "http://example.com/page.php" -v
 
 # Save results to a file
-./golfitester --url "http://example.com/page.php" --o "results.json"
+./golfitester -u "http://example.com/page.php" -o "results.json"
 
 # Include cookies
-./golfitester --url "http://example.com/page.php" --cookies "session=123456"
+./golfitester -u "http://example.com/page.php" -c "session=123456"
 
 # Add custom headers
-./golfitester --url "http://example.com/page.php" --headers "X-Forwarded-For: 127.0.0.1,User-Agent: Mozilla/5.0"
+./golfitester -u "http://example.com/page.php" -H "X-Forwarded-For: 127.0.0.1,User-Agent: Mozilla/5.0"
 
 # Set custom traversal depth
-./golfitester --url "http://example.com/page.php" --depth 5
+./golfitester -u "http://example.com/page.php" -d 5
+
+# Using a request file (e.g., from Burp Suite)
+./golfitester -r "burp_request.txt"
+
+# Using a request file and specifying parameter(s) to test
+./golfitester -r "burp_request.txt" -p "file"
+./golfitester -r "burp_request.txt" -p "file,include,path"
 ```
 
 ## Available Options
 
-| Option             | Description                                        | Default |
-|--------------------|----------------------------------------------------|---------|
-| `--url`            | Target URL to test (required)                      | -       |
-| `--param`          | Single parameter name to test                      | -       |
-| `--params`         | Comma-separated list of parameters to test         | -       |
-| `--scan-all-params`| Scan all detectable parameters in the URL          | false   |
-| `--wordlist`       | Path to wordlist file of LFI payloads              | Built-in list |
-| `--threads`        | Number of concurrent threads                       | 10      |
-| `--timeout`        | Request timeout in seconds                         | 10      |
-| `--v`              | Verbose mode                                       | false   |
-| `--o`              | Output file to save results                        | -       |
-| `--cookies`        | Cookies to include in requests                     | -       |
-| `--headers`        | Custom headers (comma-separated)                   | -       |
-| `--depth`          | Traversal depth for path traversal payloads        | 3       |
+| Option               | Description                                        | Default |
+|----------------------|----------------------------------------------------|---------|
+| `-u, --url`          | Target URL to test (required if not using request) | -       |
+| `-p, --param`        | Parameter(s) to test - comma-separated for multiple| -       |
+| `-a, --scan-all-params` | Scan all detectable parameters in the URL       | false   |
+| `-w, --wordlist`     | Path to wordlist file of LFI payloads              | Built-in list |
+| `-t, --threads`      | Number of concurrent threads                       | 10      |
+| `-to, --timeout`     | Request timeout in seconds                         | 10      |
+| `-v, --verbose`      | Verbose mode                                       | false   |
+| `-o, --output`       | Output file to save results                        | -       |
+| `-c, --cookies`      | Cookies to include in requests                     | -       |
+| `-H, --headers`      | Custom headers (comma-separated)                   | -       |
+| `-d, --depth`        | Traversal depth for path traversal payloads        | 3       |
+| `-r, --request`      | Path to a file containing a HTTP request           | -       |
+
+## Using Request Files
+
+GoLFITester supports importing HTTP requests directly from tools like Burp Suite, saving you time and ensuring your scan matches your exact test case:
+
+1. In Burp Suite, right-click on a request and select "Copy to file"
+2. Save the request to a text file
+3. Use the `-r` option to specify the file path
+4. Optionally use `-p` to specify which parameter(s) to test
+
+If no parameters are explicitly specified, the tool will extract them from the request and prompt you to confirm which ones to test. The tool will parse the request, including headers, cookies, and both GET and POST parameters, and automatically test each parameter for LFI vulnerabilities.
 
 ## Example Wordlist Format
 
@@ -104,7 +121,7 @@ GolfiTester operates by:
 
 ## Included Payloads
 
-GolfiTester includes a comprehensive database of LFI payloads, including:
+GoLFITester includes a comprehensive database of LFI payloads, including:
 
 - Path traversal with different encodings (URL-encoded, double-encoded)
 - PHP filter/wrapper techniques
