@@ -13,6 +13,9 @@ GoLFITester is a powerful and flexible Local File Inclusion (LFI) vulnerability 
 - **Customizable Wordlists**: Use your own custom LFI payloads
 - **Verbose Mode**: Detailed output for debugging and learning
 - **Extensive Payload Database**: Includes payloads from the popular payloadbox/rfi-lfi-payload-list
+- **False Positive Detection**: Warns when all payloads return success for a parameter
+- **Signature Filtering**: Ability to ignore specific signatures that trigger false positives
+- **Advanced PHP Wrapper Combinations**: Combines all PHP wrappers with all target files for comprehensive testing
 
 ## Installation
 
@@ -67,6 +70,9 @@ go build -o golfitester
 # Using a request file and specifying parameter(s) to test
 ./golfitester -r "burp_request.txt" -p "file"
 ./golfitester -r "burp_request.txt" -p "file,include,path"
+
+# Ignore specific signatures that cause false positives
+./golfitester -u "http://example.com/page.php" -i "root:x:,nobody:x:"
 ```
 
 ## Available Options
@@ -85,6 +91,7 @@ go build -o golfitester
 | `-H, --headers`      | Custom headers (comma-separated)                   | -       |
 | `-d, --depth`        | Traversal depth for path traversal payloads        | 3       |
 | `-r, --request`      | Path to a file containing a HTTP request           | -       |
+| `-i, --ignore`       | Comma-separated signatures to ignore (false positives) | -   |
 
 ## Using Request Files
 
@@ -117,19 +124,49 @@ GolfiTester operates by:
 2. **WAF Detection**: Checks if a WAF is present and applies evasion techniques if needed
 3. **Payload Testing**: Tests each parameter with various LFI payloads
 4. **Evidence Analysis**: Analyzes responses for signs of successful exploitation
-5. **Results Reporting**: Reports vulnerable endpoints and payloads that worked
+5. **False Positive Detection**: Warns when too many payloads are "successful" for a parameter
+6. **Results Reporting**: Reports vulnerable endpoints and payloads that worked
 
 ## Included Payloads
 
 GoLFITester includes a comprehensive database of LFI payloads, including:
 
 - Path traversal with different encodings (URL-encoded, double-encoded)
-- PHP filter/wrapper techniques
+- PHP filter/wrapper techniques (combined with all potential target files)
 - Null byte injection techniques
 - Various sensitive system files on Linux and Windows
 - Log file inclusion vectors
 - Configuration file inclusion vectors
+- Data stream wrappers for PHP script execution
 - And many more from the [payloadbox/rfi-lfi-payload-list](https://github.com/payloadbox/rfi-lfi-payload-list)
+
+## Handling False Positives
+
+Some applications may return "success" responses for all payloads even when they're not vulnerable to LFI. GoLFITester now:
+
+1. Detects when nearly all payloads "succeed" for a parameter (which is suspicious)
+2. Warns you of potential false positives
+3. Lets you ignore specific signatures with the `-i` flag to filter out specific indicators that trigger false positives
+
+Example:
+```bash
+# Ignore common signatures that cause false positives
+./golfitester -u "http://example.com/page.php" -i "root:x:,nobody:x:,DOCUMENT_ROOT="
+```
+
+## PHP Wrapper Payload Testing
+
+GoLFITester now generates comprehensive PHP wrapper payloads by combining various wrapper techniques with all potential target files. This significantly improves the chances of finding PHP-specific LFI vulnerabilities.
+
+The following wrapper types are tested:
+- Base64 encoding filters
+- Zlib compression filters
+- Character encoding conversion filters
+- Resource inclusion techniques
+- Data stream wrappers
+- Phar/zip archive inclusion techniques
+
+Each wrapper is combined with various traversal techniques and target files to maximize the chances of bypassing security filters.
 
 ## Security Notice
 

